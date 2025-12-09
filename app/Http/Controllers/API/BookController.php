@@ -104,37 +104,93 @@ class BookController extends Controller
 
     public function recommended(Request $request)
     {
-        $books = Book::with(['author', 'genres', 'ratings.user'])
-            ->withAvg('ratings', 'rating');
+        $limit = (int) $request->input('limit', 4);
 
         // Filter by year (published_at)
-        if ($request->filled('year')) {
-            $year = $request->input('year');
-            $books->whereYear('published_at', $year);
+        $yearFilter = $request->filled('year') ? $request->input('year') : null;
+
+        // Jika tidak ada sort parameter, gunakan multi-criteria sorting
+        if (!$request->filled('sort')) {
+            $books = Book::with(['author', 'genres', 'ratings.user'])
+                ->withAvg('ratings', 'rating')
+                ->withCount('ratings');
+
+            if ($yearFilter) {
+                $books->whereYear('published_at', $yearFilter);
+            }
+
+            $books = $books->get();
+
+            // Normalisasi setiap kriteria ke skala 0-1
+            $maxRating = $books->max('ratings_avg_rating') ?: 1;
+            $maxCount = $books->max('ratings_count') ?: 1;
+            
+            // Cari buku terbaru dan terlama untuk normalisasi tanggal
+            $newestDate = $books->max('published_at');
+            $oldestDate = $books->min('published_at');
+            $dateRange = $newestDate && $oldestDate 
+                ? strtotime($newestDate) - strtotime($oldestDate) 
+                : 1;
+
+            // Hitung score untuk setiap buku
+            $books = $books->map(function ($book) use ($maxRating, $maxCount, $newestDate, $oldestDate, $dateRange) {
+                // Rating score (bobot 40%)
+                $ratingScore = ($book->ratings_avg_rating / $maxRating) * 0.4;
+                
+                // Popular score (bobot 30%)
+                $popularScore = ($book->ratings_count / $maxCount) * 0.3;
+                
+                // Latest release score (bobot 30%)
+                $daysFromNewest = $newestDate && $book->published_at
+                    ? (strtotime($newestDate) - strtotime($book->published_at)) 
+                    : 0;
+                $recencyScore = $dateRange > 0 
+                    ? (1 - ($daysFromNewest / $dateRange)) * 0.3 
+                    : 0;
+                
+                // Total score
+                $book->recommendation_score = $ratingScore + $popularScore + $recencyScore;
+                
+                return $book;
+            });
+
+            // Sort berdasarkan recommendation score
+            $recommendedBooks = $books->sortByDesc('recommendation_score')
+                ->take($limit)
+                ->values();
+
+        } else {
+            // Single criteria sorting (existing logic)
+            $books = Book::with(['author', 'genres', 'ratings.user'])
+                ->withAvg('ratings', 'rating');
+
+            if ($yearFilter) {
+                $books->whereYear('published_at', $yearFilter);
+            }
+
+            $sort = $request->input('sort');
+
+            switch ($sort) {
+                case 'popular':
+                    $books->withCount('ratings')
+                        ->orderBy('ratings_count', 'desc');
+                    break;
+
+                case 'rated':
+                    $books->orderBy('ratings_avg_rating', 'desc');
+                    break;
+
+                case 'latest_release':
+                    $books->orderBy('published_at', 'desc');
+                    break;
+
+                default:
+                    $books->orderBy('published_at', 'desc');
+                    break;
+            }
+
+            $recommendedBooks = $books->take($limit)->get();
         }
-
-        // Sort rekomendasi
-        $sort = $request->input('sort', 'latest_release');
-
-        switch ($sort) {
-            case 'popular':
-                $books->withCount('ratings')
-                    ->orderBy('ratings_count', 'desc');
-                break;
-
-            case 'rated':
-                $books->orderBy('ratings_avg_rating', 'desc');
-                break;
-
-            case 'latest_release':
-            default:
-                $books->orderBy('published_at', 'desc');
-                break;
-        }
-
-        $limit = (int) $request->input('limit', 6);
-
-        $recommendedBooks = $books->take($limit)->get();
 
         return response()->json([
             'recommended_books' => $recommendedBooks,
