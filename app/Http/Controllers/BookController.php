@@ -1,139 +1,189 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
 use App\Models\Book;
-use App\Models\Author;
-use App\Models\Genre;
+use App\Models\BookRating;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Storage;
 
 class BookController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
-        // load author dan genres (many-to-many)
-        $books = Book::with(['author', 'genres'])->latest()->paginate(10);
-        return view('admin.books.index', compact('books'));
-    }
+        $books = Book::with(['author', 'genres', 'ratings.user'])->withAvg('ratings', 'rating');
 
-    public function create()
-    {
-        $authors = Author::all();
-        $genres = Genre::all();
-        return view('admin.books.create', compact('authors', 'genres'));
-    }
-
-    public function store(Request $request)
-    {
-        $request->validate([
-            'title' => 'required|string|max:255',
-            'slug' => 'required|string|max:255|unique:books,slug',
-            'author_id' => 'required|exists:authors,id',
-            'genres' => 'required|array',
-            'genres.*' => 'exists:genres,id',
-            'short_desc' => 'required|string',
-            'synopsis' => 'required|string',
-            'published_at' => 'required|date',
-            'languages' => 'required|array',
-            'image' => 'required|image|max:2048',
-        ]);
-
-        $data = $request->only([
-            'title', 'slug', 'author_id', 'short_desc', 'synopsis', 'published_at'
-        ]);
-        $data['languages'] = json_encode($request->languages);
-
-        if ($request->hasFile('image')) {
-            $image = $request->file('image');
-            $filename = time() . '_' . $image->getClientOriginalName();
-            $destinationPath = public_path('uploads/books'); // public/books
-
-            // Buat folder jika belum ada
-            if (!file_exists($destinationPath)) {
-                mkdir($destinationPath, 0775, true);
-            }
-
-            $image->move($destinationPath, $filename);
-            $data['image'] = 'uploads/books/' . $filename;
+        if ($request->has('search')) {
+            $search = $request->input('search');
+            $books->where('title', 'like', "%{$search}%")
+                  ->orWhereHas('author', function ($query) use ($search) {
+                      $query->where('name', 'like', "%{$search}%");
+                  });
         }
 
-        $book = Book::create($data);
-        $book->genres()->attach($request->genres);
-
-        return redirect()->route('admin.books.index')->with('success', 'Book created successfully.');
-    }
-
-    public function show(Book $book)
-    {
-        $book->load(['author', 'genres']);
-        return view('admin.books.show', compact('book'));
-    }
-
-    public function edit(Book $book)
-    {
-        $authors = Author::all();
-        $genres = Genre::all();
-        $book->load('genres');
-
-        return view('admin.books.edit', compact('book', 'authors', 'genres'));
-    }
-
-    public function update(Request $request, Book $book)
-    {
-        $request->validate([
-            'title' => 'required|string|max:255',
-            'slug' => 'required|string|max:255|unique:books,slug,' . $book->id,
-            'author_id' => 'required|exists:authors,id',
-            'genres' => 'required|array',
-            'genres.*' => 'exists:genres,id',
-            'short_desc' => 'required|string',
-            'synopsis' => 'required|string',
-            'published_at' => 'required|date',
-            'languages' => 'required|array',
-            'image' => 'nullable|image|max:2048',
-        ]);
-
-        $data = $request->only([
-            'title', 'slug', 'author_id', 'short_desc', 'synopsis', 'published_at'
-        ]);
-        $data['languages'] = json_encode($request->languages);
-
-        if ($request->hasFile('image')) {
-            // Hapus file lama saat update
-            if (isset($book) && $book->image && file_exists(public_path($book->image))) {
-                unlink(public_path($book->image));
-            }
-
-            $image = $request->file('image');
-            $filename = time() . '_' . $image->getClientOriginalName();
-            $destinationPath = public_path('uploads/books');
-
-            if (!file_exists($destinationPath)) {
-                mkdir($destinationPath, 0775, true);
-            }
-
-            $image->move($destinationPath, $filename);
-            $data['image'] = 'uploads/books/' . $filename;
+        if($request->has('genres')) {
+            $genres = $request->input('genres');
+            $books->whereHas('genres', function ($query) use ($genres) {
+                $query->whereIn('genres.name', (array) $genres);
+            });
         }
 
-        $book->update($data);
-        $book->genres()->sync($request->genres);
-
-        return redirect()->route('admin.books.index')->with('success', 'Book updated successfully.');
-    }
-
-    public function destroy(Book $book)
-    {
-        if ($book->image && file_exists(public_path($book->image))) {
-            unlink(public_path($book->image));
+        if ($request->has('languages')) {
+            $languages = (array) $request->input('languages');
+            $books->where(function ($query) use ($languages) {
+                foreach ($languages as $lang) {
+                    $query->orWhereJsonContains('languages', $lang);
+                }
+            });
         }
 
-        $book->genres()->detach();
+        if($request->has('authors')) {
+            $authors = (array) $request->input('authors');
+            $books->whereHas('author', function ($query) use ($authors) {
+                $query->whereIn('name', $authors);
+            });
+        }
 
-        $book->delete();
+        if ($request->filled('year')) {
+            $year = $request->input('year');
+            $books->whereYear('published_at', $year);
+        }
 
-        return redirect()->route('admin.books.index')->with('success', 'Book deleted successfully.');
+        if ($request->has('sort')) {
+            $sort = $request->input('sort');
+            switch ($sort) {
+                case 'latest':
+                    $books->latest();
+                    break;
+                case 'oldest':
+                    $books->oldest();
+                    break;
+                case 'latest_release':
+                    $books->orderBy('published_at', 'desc');
+                    break;
+                case 'popular':
+                    $books->withCount('ratings')->orderBy('ratings_count', 'desc');
+                    break;
+                case 'rated':
+                    $books->orderBy('ratings_avg_rating', 'desc');
+                    break;
+            }
+        }
+
+        if($request->has('perPage')) {
+            $perPage = $request->input('perPage');
+            $books = $books->paginate($perPage);
+        } else {
+            $books = $books->get();
+        }
+
+        return response()->json([
+            'books' => $books
+        ]);
+    }
+
+    public function show($slug)
+    {
+        $book = Book::with(['author', 'genres', 'ratings.user'])->withAvg('ratings', 'rating')->where('slug', $slug)->first();
+
+        if (!$book) {
+            return response()->json(['message' => 'Book not found'], 404);
+        }
+
+        return response()->json(['book' => $book]);
+    }
+
+    public function totalReviews()
+    {
+        $totalReviews = Book::withCount('ratings')->get()->sum('ratings_count');
+
+        return response()->json([
+            'total_reviews' => $totalReviews
+        ]);
+    }
+
+    public function recommended(Request $request)
+    {
+        $books = Book::with(['author', 'genres', 'ratings.user'])
+            ->withAvg('ratings', 'rating');
+
+        // Filter by year (published_at)
+        if ($request->filled('year')) {
+            $year = $request->input('year');
+            $books->whereYear('published_at', $year);
+        }
+
+        // Sort rekomendasi
+        $sort = $request->input('sort', 'latest_release');
+
+        switch ($sort) {
+            case 'popular':
+                $books->withCount('ratings')
+                    ->orderBy('ratings_count', 'desc');
+                break;
+
+            case 'rated':
+                $books->orderBy('ratings_avg_rating', 'desc');
+                break;
+
+            case 'latest_release':
+            default:
+                $books->orderBy('published_at', 'desc');
+                break;
+        }
+
+        $limit = (int) $request->input('limit', 6);
+
+        $recommendedBooks = $books->take($limit)->get();
+
+        return response()->json([
+            'recommended_books' => $recommendedBooks,
+        ]);
+    }
+
+    public function reviews($slug)
+    {
+        $book = Book::where('slug', $slug)
+            ->with(['ratings.user'])
+            ->firstOrFail();
+
+        return response()->json([
+            'reviews' => $book->ratings,
+        ]);
+    }
+
+    public function rate(Request $request, $slug)
+    {
+        $book = Book::where('slug', $slug)->firstOrFail();
+
+        // pastikan user login
+        $user = $request->user();
+
+        $data = $request->validate([
+            'rating' => 'required|integer|min:1|max:5',
+            'review' => 'nullable|string|max:2000',
+        ]);
+
+        // user hanya boleh 1 rating per buku → update kalau sudah ada
+        $rating = BookRating::updateOrCreate(
+            [
+                'user_id' => $user->id,
+                'book_id' => $book->id,
+            ],
+            [
+                'rating' => $data['rating'],
+                'review' => $data['review'] ?? '',
+            ]
+        );
+
+        // refresh average dan list rating
+        $book->load(['ratings.user'])
+             ->loadAvg('ratings', 'rating');
+
+        return response()->json([
+            'message' => 'Rating saved',
+            'rating'  => $rating,
+            'book'    => $book,
+        ]);
     }
 }
